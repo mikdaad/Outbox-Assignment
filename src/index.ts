@@ -1,54 +1,106 @@
 // src/index.ts
 
-// --- Imports ---
-// Use the new ESM-style import for dotenv
+
 import 'dotenv/config'; 
-// Use the .js extension for local file imports in an ESM project
 import { ImapService, ImapConfig } from './services/imap.service.js'; 
 import { ElasticsearchService } from './services/elasticsearch.service.js';
+import { AiService } from  './services/ai.services.js';
+import { NotificationService } from './services/notification.services.js';
 import { ParsedMail } from 'mailparser';
+import express from 'express';
+import cors from 'cors';
+import emailRoutes from './controllers/email.routes.js';
+
+/**
+ * A simple promise-based delay function.
+ * @param ms The number of milliseconds to wait.
+ */
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// --- FIX: Implement a Queue to process emails sequentially ---
+// This queue will hold all incoming emails waiting to be processed.
+const emailQueue: { mail: ParsedMail, accountUser: string }[] = [];
+// This flag prevents multiple workers from running at the same time.
+let isProcessing = false;
 
 /**
  * The main entry point for the application.
- * We wrap the startup logic in an async function to use 'await'.
  */
 async function main() {
-    // --- 1. Initialize Services ---
-    // Create a single instance of the Elasticsearch service.
+    // --- 1. Initialize All Services ---
     const elasticsearchService = new ElasticsearchService();
+    const aiService = new AiService();
+    const notificationService = new NotificationService();
     
     console.log('[App] Starting services...');
-    // Setup the Elasticsearch index. This creates the 'emails' index if it doesn't exist.
-    // We 'await' this to ensure the index is ready before we start fetching emails.
     await elasticsearchService.setupIndex();
-    console.log('[App] Elasticsearch service is ready.');
+    console.log('[App] All services are ready.');
 
-
-    // --- 2. Define the Core Logic ---
     /**
-     * This callback function is the heart of the application.
-     * It's triggered by the ImapService every time a new email is parsed.
-     * @param mail The parsed email object.
-     * @param accountUser The email address of the account that received the mail.
+     * The Queue Worker: Processes emails from the queue one by one.
      */
-    function processNewEmail(mail: ParsedMail, accountUser: string) {
-        console.log(`--- Processing New Email for ${accountUser} ---`);
-        console.log(`   Subject: ${mail.subject}`);
 
-        // Here is the integration point:
-        // The email from the IMAP service is passed directly to the Elasticsearch service to be saved.
-        elasticsearchService.indexEmail(mail, accountUser);
-        
-        // --- UPCOMING FEATURES WILL GO HERE ---
-        // TODO: Call AI service to categorize the email.
-        // TODO: Send Slack/Webhook notifications if category is 'Interested'.
+    const app = express();
+    const PORT = process.env.PORT || 3001;
 
-        console.log('------------------------------------------\n');
+    app.use(cors()); // Enable Cross-Origin Resource Sharing
+    app.use(express.json()); // Middleware to parse JSON bodies
+
+    // Use the email API routes
+    app.use('/api', emailRoutes);
+
+    app.listen(PORT, () => {
+        console.log(`[API] Server is running on http://localhost:${PORT}`);
+    });
+
+    async function processQueue() {
+        if (isProcessing) return; // Don't start a new worker if one is already running.
+        isProcessing = true;
+        console.log(`[Queue] Worker started. Items to process: ${emailQueue.length}`);
+
+        // Process items until the queue is empty.
+        while (emailQueue.length > 0) {
+            const { mail, accountUser } = emailQueue.shift()!; // Get the next email from the queue
+
+            console.log(`--- Processing Email for ${accountUser} ---`);
+            console.log(`   Subject: ${mail.subject}`);
+
+            // Step 1: Categorize the email with AI
+            const category = await aiService.categorizeEmail(mail);
+            console.log(`[App] AI categorized email as: ${category}`);
+
+            // Step 2: Index the email in Elasticsearch with its new category
+            await elasticsearchService.indexEmail(mail, accountUser, category);
+            
+            // Step 3: If the lead is interested, send notifications
+            if (category === 'Interested') {
+                console.log('[App] "Interested" lead found! Triggering notifications...');
+                notificationService.sendSlackNotification(mail);
+                notificationService.triggerWebhook(mail, category);
+            }
+
+            console.log('------------------------------------------\n');
+            
+            // FIX: Increase delay to respect the 3 requests-per-minute (RPM) limit.
+            // The error suggests waiting 20 seconds, so we'll wait 21 seconds to be safe.
+            await delay(21000); 
+        }
+
+        isProcessing = false;
+        console.log('[Queue] Worker finished. Queue is empty.');
     }
 
+    /**
+     * This function now acts as a producer, adding emails to the queue.
+     */
+    function onNewEmail(mail: ParsedMail, accountUser: string) {
+        console.log(`[Queue] New email received, adding to queue. Subject: "${mail.subject}"`);
+        emailQueue.push({ mail, accountUser });
+        // Start the queue processor if it's not already running.
+        processQueue();
+    }
 
     // --- 3. Configure and Start IMAP Listeners ---
-    // Load the account configurations from your .env file.
     const accounts: ImapConfig[] = [
         {
             user: process.env.IMAP_USER_1!,
@@ -67,22 +119,19 @@ async function main() {
     ];
 
     console.log('[App] Starting IMAP listeners...');
-    // Loop through each account configuration.
     accounts.forEach(config => {
-        // Ensure that user and password exist before trying to connect.
         if (config.user && config.password) {
-            // Create a new ImapService instance for this specific account.
-            // Pass our `processNewEmail` function as the callback.
-            const imapService = new ImapService(config, processNewEmail);
-            // Start the connection. This will run in the background.
+            // Pass the new 'onNewEmail' function as the callback.
+            const imapService = new ImapService(config, onNewEmail);
             imapService.connect();
         }
     });
     console.log('[App] All IMAP services are connecting...');
+
+    
 }
 
 // --- Run the Application ---
-// Call the main function and catch any errors that might occur during startup.
 main().catch(error => {
     console.error('[App] A critical error occurred during startup:', error);
     process.exit(1);
