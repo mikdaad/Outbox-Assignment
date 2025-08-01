@@ -14,7 +14,12 @@ export class ElasticsearchService {
 
     constructor() {
         // Initialize the client to connect to the local Docker container.
-        this.client = new Client({ node: 'http://localhost:9200' });
+        this.client = new Client({ 
+            node: 'http://localhost:9200',
+            // FIX: Increase the request timeout to 30 seconds (default is often lower).
+            // This gives Elasticsearch more time to process requests during the initial high-load sync.
+            requestTimeout: 50000 
+        });
     }
 
     /**

@@ -5,9 +5,10 @@ services:
     container_name: elasticsearch
     environment:
       - discovery.type=single-node
-      - xpack.security.enabled=false # Disables security for easy local development
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g" # <-- ADD THIS LINE to allocate 1GB of memory
     ports:
-      - "9200:9200" # Exposes Elasticsearch on localhost:9200
+      - "9200:9200"
     volumes:
       - esdata:/usr/share/elasticsearch/data
 
